@@ -194,11 +194,10 @@ def _normalize_ip_field(ip_str: str, resolver: ObjectResolver) -> List[IPNetwork
     return sorted(list(set(networks)), key=lambda n: n.network_address)
 def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> Tuple[List[Rule], List[Rule], int]:
     """Loads and normalizes rules from the user-provided CSV format."""
-    active, disabled = [], []
-    rule_pos = 0
+    all_rules = []
+    total_count = 0
     try:
         with open(rules_path, 'r', encoding='utf-8-sig') as f:
-            # Auto-detect delimiter
             sample = f.read(2048)
             if not sample:
                 LOG.warning(f"Rules file {rules_path} is empty.")
@@ -209,54 +208,43 @@ def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> T
                 dialect = csv.Sniffer().sniff(sample, delimiters=';,')
                 reader = csv.DictReader(f, dialect=dialect)
             except csv.Error:
-                LOG.warning(f"Could not determine delimiter for {rules_path}. Assuming comma.")
+                LOG.warning(f"Could not determine delimiter for {rules_path}. Assuming semicolon.")
                 f.seek(0)
-                reader = csv.DictReader(f, delimiter=',')
+                reader = csv.DictReader(f, delimiter=';')
 
-            # Clean fieldnames, remove '#' and spaces
             reader.fieldnames = [name.strip().lstrip('#') for name in reader.fieldnames or []]
             rows = list(reader)
-
             total_count = len(rows)
+
             for i, row in enumerate(rows):
                 try:
-                    # Skip separators or non-rule lines
-                    if row.get('type_slot') != 'rule':
+                    # Skip empty rows that might result from separators
+                    if not any(row.values()):
+                        total_count -= 1
                         continue
 
-                    rule_pos += 1
-                    # Map new headers to internal Rule fields
-                    slot = 'filter' # Defaulting to filter, as 'slot' is not in the new format
-                    if 'nat_to_target' in row and row['nat_to_target']:
-                        slot = 'nat'
-
+                    slot = row.get('slot', 'filter')
                     if slot_filter != 'both' and slot != slot_filter:
                         continue
 
                     enabled_states = {'on', 'active', 'enabled', 'true'}
-                    is_enabled = row.get('state', 'true').lower() in enabled_states
+                    is_enabled = str(row.get('enabled', 'true')).lower() in enabled_states
 
                     rule = Rule(
-                        rule_id=row.get('rule_name') or f"row_{i+2}",
-                        position=rule_pos,
+                        rule_id=row.get('rule_id') or f"row_{i+2}",
+                        position=int(row.get('position', i + 1)),
                         slot=slot,
                         enabled=is_enabled,
                         action=row.get('action', 'pass'),
                         comment=row.get('comment', ''),
-                        raw_src=row.get('from_src', 'any'),
-                        raw_dst=row.get('to_dest', 'any'),
-                        raw_svc=row.get('service', 'any'),
+                        raw_src=row.get('src', 'any'),
+                        raw_dst=row.get('dst', 'any'),
+                        raw_svc=row.get('svc', 'any'),
                         raw_proto=row.get('proto', 'any'),
                         src_ips=[], dst_ips=[], services=[]
                     )
+                    all_rules.append(rule)
 
-                    if is_enabled:
-                        rule.src_ips = _normalize_ip_field(rule.raw_src, resolver)
-                        rule.dst_ips = _normalize_ip_field(rule.raw_dst, resolver)
-                        rule.services = _normalize_services(rule.raw_proto, rule.raw_svc, resolver)
-                        active.append(rule)
-                    else:
-                        disabled.append(rule)
                 except (KeyError, ValueError) as e:
                     LOG.error(f"Skipping invalid rule at row {i+2} in {rules_path}: {e}. Row: {row}")
                     continue
@@ -267,7 +255,17 @@ def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> T
         LOG.error(f"A required column is missing in {rules_path}. "
                   f"Please check the CSV headers. Detected headers: {reader.fieldnames}. Underlying error: {e}")
         raise
-    # No need to sort by position anymore as it's sequential
+
+    # Sort active rules by position for correct analysis order
+    active = sorted([r for r in all_rules if r.enabled], key=lambda r: r.position)
+    disabled = [r for r in all_rules if not r.enabled]
+
+    # Normalize fields for active rules only
+    for rule in active:
+        rule.src_ips = _normalize_ip_field(rule.raw_src, resolver)
+        rule.dst_ips = _normalize_ip_field(rule.raw_dst, resolver)
+        rule.services = _normalize_services(rule.raw_proto, rule.raw_svc, resolver)
+
     return active, disabled, total_count
 
 # --- Detection Engine ---

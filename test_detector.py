@@ -18,18 +18,16 @@ from detect_stormshield_anomalies import (
     ObjectResolver,
     load_rules,
     run_analysis,
-    _parse_ip_token,
-    _parse_port_token
 )
 
 # Suppress logging during tests
 logging.disable(logging.CRITICAL)
 
-# Define the new header format for reusability in tests
-NEW_HEADER = "#type_slot,#rule_name,#state,#action,#from_src,#to_dest,#service,#proto,#comment\n"
+# Define the correct header format for reusability in tests
+CORRECT_HEADER = "rule_id;position;slot;enabled;action;src;dst;svc;proto;comment\n"
 
 class TestParsingAndNormalization(unittest.TestCase):
-    """Tests for parsing, normalization, and object resolution with the new format."""
+    """Tests for parsing, normalization, and object resolution with the correct format."""
 
     def test_object_resolver(self):
         objects_csv = "name;type;value\nhost_a;host;1.1.1.1/32"
@@ -44,30 +42,29 @@ class TestParsingAndNormalization(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolver.resolve_ip_group("grp_a")
 
-    def test_load_rules_new_format(self):
+    def test_load_rules_correct_format(self):
         rules_csv = (
-            NEW_HEADER +
-            "rule,Rule1,on,allow,1.1.1.1,2.2.2.2,80,tcp,Test rule 1\n" +
-            "separator,,,,,,,,\n" + # Should be skipped
-            "rule,Rule2,off,deny,any,any,any,any,Test rule 2\n"
+            CORRECT_HEADER +
+            "R1;1;filter;true;allow;1.1.1.1;2.2.2.2;80;tcp;Test rule 1\n" +
+            "R2;2;filter;false;deny;any;any;any;any;Test rule 2\n"
         )
         with patch('builtins.open', return_value=io.StringIO(rules_csv)):
             resolver = ObjectResolver(None)
             active, disabled, total = load_rules("rules.csv", resolver, "both")
 
-            self.assertEqual(total, 3)
+            self.assertEqual(total, 2)
             self.assertEqual(len(active), 1)
             self.assertEqual(len(disabled), 1)
 
-            self.assertEqual(active[0].rule_id, "Rule1")
-            self.assertEqual(active[0].position, 1) # First actual rule
-            self.assertEqual(disabled[0].rule_id, "Rule2")
+            self.assertEqual(active[0].rule_id, "R1")
+            self.assertEqual(active[0].position, 1)
+            self.assertEqual(disabled[0].rule_id, "R2")
             self.assertTrue(active[0].enabled)
             self.assertFalse(disabled[0].enabled)
 
 
-class TestAnalysisEngineNewFormat(unittest.TestCase):
-    """High-level tests for the main analysis engine with the new CSV format."""
+class TestAnalysisEngineCorrectFormat(unittest.TestCase):
+    """High-level tests for the main analysis engine with the correct CSV format."""
 
     def run_test_on_rules(self, rules_data, objects_data="name;type;value\n"):
         """Helper to run analysis on given CSV data."""
@@ -87,9 +84,9 @@ class TestAnalysisEngineNewFormat(unittest.TestCase):
 
     def test_shadowed_same_action(self):
         rules = (
-            NEW_HEADER +
-            "rule,R1,on,allow,any,any,any,any,\n" +
-            "rule,R2,on,allow,10.0.0.1,any,any,any,"
+            CORRECT_HEADER +
+            "R1;1;filter;true;allow;any;any;any;any;\n" +
+            "R2;2;filter;true;allow;10.0.0.1;any;any;any;"
         )
         results = self.run_test_on_rules(rules)
         self.assertEqual(len(results.shadowed_same_action), 1)
@@ -98,9 +95,9 @@ class TestAnalysisEngineNewFormat(unittest.TestCase):
 
     def test_shadowed_conflict(self):
         rules = (
-            NEW_HEADER +
-            "rule,R1,on,deny,10.0.0.0/8,any,any,any,\n" +
-            "rule,R2,on,allow,10.0.0.0/16,any,any,any,"
+            CORRECT_HEADER +
+            "R1;1;filter;true;deny;10.0.0.0/8;any;any;any;\n" +
+            "R2;2;filter;true;allow;10.0.0.0/16;any;any;any;"
         )
         results = self.run_test_on_rules(rules)
         self.assertEqual(len(results.shadowed_conflict), 1)
@@ -108,9 +105,9 @@ class TestAnalysisEngineNewFormat(unittest.TestCase):
 
     def test_duplicate(self):
         rules = (
-            NEW_HEADER +
-            "rule,R1,on,allow,1.1.1.1,2.2.2.2,80,tcp,\n" +
-            "rule,R2,on,allow,1.1.1.1,2.2.2.2,80,tcp,"
+            CORRECT_HEADER +
+            "R1;1;filter;true;allow;1.1.1.1;2.2.2.2;80;tcp;\n" +
+            "R2;2;filter;true;allow;1.1.1.1;2.2.2.2;80;tcp;"
         )
         results = self.run_test_on_rules(rules)
         self.assertEqual(len(results.duplicates), 1)
@@ -118,9 +115,9 @@ class TestAnalysisEngineNewFormat(unittest.TestCase):
 
     def test_conflict(self):
         rules = (
-            NEW_HEADER +
-            "rule,R1,on,allow,10.0.0.0/24,any,80,tcp,\n" +
-            "rule,R2,on,deny,10.0.0.0/16,any,80,tcp,"
+            CORRECT_HEADER +
+            "R1;1;filter;true;allow;10.0.0.0/24;any;80;tcp;\n" +
+            "R2;2;filter;true;deny;10.0.0.0/16;any;80;tcp;"
         )
         results = self.run_test_on_rules(rules)
         self.assertEqual(len(results.conflicts), 1)
@@ -128,11 +125,10 @@ class TestAnalysisEngineNewFormat(unittest.TestCase):
         self.assertEqual(results.conflicts[0]['rule_b'], "R1")
 
     def test_no_anomaly_between_slots(self):
-        # This test needs to be adapted as slot is now inferred
         rules = (
-            "#type_slot,#rule_name,#state,#action,#from_src,#to_dest,#service,#proto,#comment,#nat_to_target\n" +
-            "rule,R1,on,allow,any,any,any,any,,,\n" +  # This is a filter rule
-            "rule,R2,on,snat,10.0.0.1,any,any,any,,some_nat_host" # This is a NAT rule
+            CORRECT_HEADER +
+            "R1;1;filter;true;allow;any;any;any;any;\n" +
+            "R2;1;nat;true;snat;any;any;any;any;" # Same position, different slot
         )
         results = self.run_test_on_rules(rules)
         self.assertEqual(len(results.shadowed_same_action), 0)
