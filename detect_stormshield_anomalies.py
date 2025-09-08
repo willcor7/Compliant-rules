@@ -83,8 +83,32 @@ class ObjectResolver:
         if not objects_path: return {}
         try:
             with open(objects_path, 'r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f, delimiter=';'); return {row['name']: {'type': row['type'], 'value': row['value']} for row in reader}
-        except (IOError, csv.Error) as e: LOG.error(f"Failed to read/parse objects file {objects_path}: {e}"); raise
+                # Sniff to find the delimiter
+                try:
+                    dialect = csv.Sniffer().sniff(f.read(1024), delimiters=';,')
+                    f.seek(0)
+                    reader = csv.DictReader(f, dialect=dialect)
+                    # Verify headers before processing
+                    expected_headers = {'name', 'type', 'value'}
+                    if not expected_headers.issubset(set(reader.fieldnames or [])):
+                        LOG.error(f"Missing required headers in {objects_path}. "
+                                  f"Expected: {expected_headers}. Found: {reader.fieldnames}")
+                        raise ValueError(f"Invalid headers in {objects_path}")
+                    return {row['name']: {'type': row['type'], 'value': row['value']} for row in reader}
+                except csv.Error:
+                    LOG.error(f"Could not determine delimiter for {objects_path}. Assuming ';'.")
+                    f.seek(0)
+                    reader = csv.DictReader(f, delimiter=';')
+                    return {row['name']: {'type': row['type'], 'value': row['value']} for row in reader}
+
+        except (IOError, csv.Error) as e:
+            LOG.error(f"Failed to read/parse objects file {objects_path}: {e}")
+            raise
+        except KeyError as e:
+            LOG.error(f"A required column is missing in {objects_path}. "
+                      f"Please check that the headers are exactly 'name', 'type', and 'value'. "
+                      f"Underlying error: {e}")
+            raise
     def resolve_ip_group(self, name: str, path: Optional[Set[str]] = None) -> List[IPNetwork]:
         path = path or set();
         if name in path: raise ValueError(f"Circular dependency in IP groups: {' -> '.join(path)} -> {name}")
@@ -171,8 +195,17 @@ def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> T
     total_count = 0
     try:
         with open(rules_path, 'r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f, delimiter=';')
-            rows = list(reader)
+            try:
+                dialect = csv.Sniffer().sniff(f.read(2048), delimiters=';,')
+                f.seek(0)
+                reader = csv.DictReader(f, dialect=dialect)
+                rows = list(reader)
+            except csv.Error:
+                LOG.warning(f"Could not determine delimiter for {rules_path}. Assuming ';'.")
+                f.seek(0)
+                reader = csv.DictReader(f, delimiter=';')
+                rows = list(reader)
+
             total_count = len(rows)
             for i, row in enumerate(rows):
                 try:
@@ -190,8 +223,16 @@ def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> T
                         rule.services = _normalize_services(rule.raw_proto, rule.raw_svc, resolver)
                         active.append(rule)
                     else: disabled.append(rule)
-                except (KeyError, ValueError) as e: LOG.error(f"Skipping invalid rule at row {i+2}: {e}. Row: {row}"); continue
-    except (IOError, csv.Error) as e: LOG.error(f"Failed to process rules file {rules_path}: {e}"); raise
+                except (KeyError, ValueError) as e:
+                    LOG.error(f"Skipping invalid rule at row {i+2} in {rules_path}: {e}. Row: {row}")
+                    continue
+    except (IOError, csv.Error) as e:
+        LOG.error(f"Failed to process rules file {rules_path}: {e}")
+        raise
+    except KeyError as e:
+        LOG.error(f"A required column is missing in {rules_path}. "
+                  f"Please check the CSV headers. Underlying error: {e}")
+        raise
     active.sort(key=lambda r: r.position); return active, disabled, total_count
 
 # --- Detection Engine ---
