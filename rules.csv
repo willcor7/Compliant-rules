@@ -1,0 +1,6 @@
+rule_id;position;slot;enabled;action;src;dst;svc;proto;in_if;out_if;schedule;users;comment
+R1;1;filter;true;allow;10.0.0.0/24;192.168.1.0/24;80,443;tcp;;;;
+R2;2;filter;true;allow;10.0.0.10-10.0.0.20;192.168.1.100/32;80;tcp;;;;
+R3;3;filter;true;deny;10.0.0.0/8;192.168.0.0/16;1-65535;tcp;;;;
+R4;4;filter;false;allow;any;any;any;any;;;;
+R5;5;nat;true;snat;10.0.0.0/24;any;any;any;;;;

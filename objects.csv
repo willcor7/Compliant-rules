@@ -1,0 +1,5 @@
+name;type;value
+srv_web;host;192.168.1.100/32
+prod_nets;group;10.0.0.0/24,10.0.1.0/24
+http;service;tcp:80
+web;service_group;http,tcp:443
