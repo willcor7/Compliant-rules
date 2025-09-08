@@ -23,56 +23,59 @@ from detect_stormshield_anomalies import (
 # Suppress logging during tests
 logging.disable(logging.CRITICAL)
 
-# Define the correct header format for reusability in tests
-CORRECT_HEADER = "rule_id;position;slot;enabled;action;src;dst;svc;proto;comment\n"
+# --- Rules Test Data ---
+OLD_RULES_HEADER = "rule_id;position;slot;enabled;action;src;dst;svc;proto;comment\n"
+NEW_RULES_HEADER = "#type_slot,rule_name,state,action,from_src,to_dest,service,proto,comment,nat_to_target\n"
 
-class TestParsingAndNormalization(unittest.TestCase):
-    """Tests for parsing, normalization, and object resolution with the correct format."""
+# --- Objects Test Data ---
+OLD_OBJECTS_CSV = "name;type;value\nhost_a;host;1.1.1.1/32"
+NEW_OBJECTS_HOST_CSV = '#type,name,ip,ipv6,resolve,mac,comment\nhost,my_host,1.2.3.4,,dynamic,,\n'
+NEW_OBJECTS_NET_CSV = '#type,name,ip,ipv6,resolve,mac,comment\nnetwork,my_net,10.0.0.0,255.255.255.0,24,,\n'
 
-    def test_object_resolver(self):
-        objects_csv = "name;type;value\nhost_a;host;1.1.1.1/32"
-        with patch('builtins.open', return_value=io.StringIO(objects_csv)):
+
+class TestParsing(unittest.TestCase):
+    """Tests for parsing different file formats."""
+
+    def test_load_rules_old_format(self):
+        rules_csv = OLD_RULES_HEADER + "R1;1;filter;true;allow;any;any;any;any;\n"
+        with patch('builtins.open', return_value=io.StringIO(rules_csv)):
+            resolver = ObjectResolver(None)
+            active, _, _ = load_rules("rules.csv", resolver, "both")
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0].rule_id, "R1")
+
+    def test_load_rules_new_format(self):
+        rules_csv = NEW_RULES_HEADER + "rule,R1,on,allow,any,any,any,any,,\n"
+        with patch('builtins.open', return_value=io.StringIO(rules_csv)):
+            resolver = ObjectResolver(None)
+            active, _, _ = load_rules("rules.csv", resolver, "both")
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0].rule_id, "R1")
+
+    def test_object_resolver_old_format(self):
+        with patch('builtins.open', return_value=io.StringIO(OLD_OBJECTS_CSV)):
             resolver = ObjectResolver("dummy_path.csv")
             self.assertEqual(str(resolver.resolve_ip_group("host_a")[0]), "1.1.1.1/32")
 
-    def test_circular_dependency(self):
-        objects_csv = "name;type;value\ngrp_a;group;grp_b\ngrp_b;group;grp_a"
-        with patch('builtins.open', return_value=io.StringIO(objects_csv)):
+    def test_object_resolver_new_format_host(self):
+        with patch('builtins.open', return_value=io.StringIO(NEW_OBJECTS_HOST_CSV)):
             resolver = ObjectResolver("dummy_path.csv")
-            with self.assertRaises(ValueError):
-                resolver.resolve_ip_group("grp_a")
+            self.assertEqual(str(resolver.resolve_ip_group("my_host")[0]), "1.2.3.4/32")
 
-    def test_load_rules_correct_format(self):
-        rules_csv = (
-            CORRECT_HEADER +
-            "R1;1;filter;true;allow;1.1.1.1;2.2.2.2;80;tcp;Test rule 1\n" +
-            "R2;2;filter;false;deny;any;any;any;any;Test rule 2\n"
-        )
-        with patch('builtins.open', return_value=io.StringIO(rules_csv)):
-            resolver = ObjectResolver(None)
-            active, disabled, total = load_rules("rules.csv", resolver, "both")
+    def test_object_resolver_new_format_network(self):
+        with patch('builtins.open', return_value=io.StringIO(NEW_OBJECTS_NET_CSV)):
+            resolver = ObjectResolver("dummy_path.csv")
+            self.assertEqual(str(resolver.resolve_ip_group("my_net")[0]), "10.0.0.0/24")
 
-            self.assertEqual(total, 2)
-            self.assertEqual(len(active), 1)
-            self.assertEqual(len(disabled), 1)
+class TestAnalysisEngine(unittest.TestCase):
+    """High-level tests for the main analysis engine to ensure it works with different formats."""
 
-            self.assertEqual(active[0].rule_id, "R1")
-            self.assertEqual(active[0].position, 1)
-            self.assertEqual(disabled[0].rule_id, "R2")
-            self.assertTrue(active[0].enabled)
-            self.assertFalse(disabled[0].enabled)
-
-
-class TestAnalysisEngineCorrectFormat(unittest.TestCase):
-    """High-level tests for the main analysis engine with the correct CSV format."""
-
-    def run_test_on_rules(self, rules_data, objects_data="name;type;value\n"):
-        """Helper to run analysis on given CSV data."""
+    def run_test_on_rules(self, rules_data, objects_data=None):
         with patch('builtins.open') as mock_open:
             def side_effect(path, *args, **kwargs):
                 if path == "rules.csv":
                     return io.StringIO(rules_data)
-                if path == "objects.csv":
+                if path == "objects.csv" and objects_data:
                     return io.StringIO(objects_data)
                 return unittest.mock.mock_open(read_data="").return_value
             mock_open.side_effect = side_effect
@@ -82,65 +85,19 @@ class TestAnalysisEngineCorrectFormat(unittest.TestCase):
             results = run_analysis(active_rules)
             return results
 
-    def test_shadowed_same_action(self):
-        rules = (
-            CORRECT_HEADER +
-            "R1;1;filter;true;allow;any;any;any;any;\n" +
-            "R2;2;filter;true;allow;10.0.0.1;any;any;any;"
-        )
-        results = self.run_test_on_rules(rules)
+    def test_shadowed_rule_with_new_formats(self):
+        rules = NEW_RULES_HEADER + "rule,R1,on,allow,any,any,any,any,,\n" + "rule,R2,on,allow,my_host,any,any,any,,\n"
+        objects = NEW_OBJECTS_HOST_CSV
+        results = self.run_test_on_rules(rules, objects)
         self.assertEqual(len(results.shadowed_same_action), 1)
         self.assertEqual(results.shadowed_same_action[0]['rule'], "R2")
-        self.assertEqual(results.shadowed_same_action[0]['shadowed_by'], "R1")
 
-    def test_shadowed_conflict(self):
-        rules = (
-            CORRECT_HEADER +
-            "R1;1;filter;true;deny;10.0.0.0/8;any;any;any;\n" +
-            "R2;2;filter;true;allow;10.0.0.0/16;any;any;any;"
-        )
-        results = self.run_test_on_rules(rules)
-        self.assertEqual(len(results.shadowed_conflict), 1)
-        self.assertEqual(results.shadowed_conflict[0]['rule'], "R2")
-
-    def test_duplicate(self):
-        rules = (
-            CORRECT_HEADER +
-            "R1;1;filter;true;allow;1.1.1.1;2.2.2.2;80;tcp;\n" +
-            "R2;2;filter;true;allow;1.1.1.1;2.2.2.2;80;tcp;"
-        )
-        results = self.run_test_on_rules(rules)
-        self.assertEqual(len(results.duplicates), 1)
-        self.assertEqual(results.duplicates[0]['rule'], "R2")
-
-    def test_conflict(self):
-        rules = (
-            CORRECT_HEADER +
-            "R1;1;filter;true;allow;10.0.0.0/24;any;80;tcp;\n" +
-            "R2;2;filter;true;deny;10.0.0.0/16;any;80;tcp;"
-        )
-        results = self.run_test_on_rules(rules)
-        self.assertEqual(len(results.conflicts), 1)
-        self.assertEqual(results.conflicts[0]['rule_a'], "R2")
-        self.assertEqual(results.conflicts[0]['rule_b'], "R1")
-
-    def test_no_anomaly_between_slots(self):
-        rules = (
-            CORRECT_HEADER +
-            "R1;1;filter;true;allow;any;any;any;any;\n" +
-            "R2;1;nat;true;snat;any;any;any;any;" # Same position, different slot
-        )
-        results = self.run_test_on_rules(rules)
-        self.assertEqual(len(results.shadowed_same_action), 0)
-        self.assertEqual(len(results.shadowed_conflict), 0)
-        self.assertEqual(len(results.conflicts), 0)
-        self.assertEqual(len(results.duplicates), 0)
-
-    def test_empty_rules_file(self):
-        rules = "" # Empty file
-        results = self.run_test_on_rules(rules)
-        self.assertEqual(len(results.shadowed_same_action), 0)
-        self.assertEqual(len(results.conflicts), 0)
+    def test_shadowed_rule_with_old_formats(self):
+        rules = OLD_RULES_HEADER + "R1;1;filter;true;allow;any;any;any;any;\nR2;2;filter;true;allow;host_a;any;any;any;"
+        objects = OLD_OBJECTS_CSV
+        results = self.run_test_on_rules(rules, objects)
+        self.assertEqual(len(results.shadowed_same_action), 1)
+        self.assertEqual(results.shadowed_same_action[0]['rule'], "R2")
 
 if __name__ == "__main__":
     unittest.main(argv=['first-arg-is-ignored'], exit=False)

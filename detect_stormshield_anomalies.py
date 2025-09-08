@@ -81,6 +81,7 @@ class ObjectResolver:
         self.unknown_objects: Set[str] = set()
     def _load_raw_objects(self, objects_path: Optional[str]) -> Dict[str, Dict[str, str]]:
         if not objects_path: return {}
+        objects = {}
         try:
             with open(objects_path, 'r', encoding='utf-8-sig') as f:
                 sample = f.read(2048)
@@ -89,28 +90,56 @@ class ObjectResolver:
                     return {}
                 f.seek(0)
 
-                try:
-                    dialect = csv.Sniffer().sniff(sample, delimiters=';,')
-                    reader = csv.DictReader(f, dialect=dialect)
-                except csv.Error:
-                    LOG.warning(f"Could not determine delimiter for {objects_path}. Assuming comma.")
-                    f.seek(0)
-                    reader = csv.DictReader(f, delimiter=',')
+                is_new_format = sample.lstrip().startswith('#')
 
-                try:
-                    return {row['name']: {'type': row['type'], 'value': row['value']} for row in reader}
-                except KeyError:
-                    # Rewind and get field names for detailed error
+                if is_new_format:
+                    LOG.info("Detected new object format.")
+                    reader = csv.reader(f, delimiter=',')
+                    try:
+                        header_row = next(reader)
+                        fieldnames = [h.strip().lstrip('#') for h in header_row]
+                    except StopIteration:
+                        return {}
+
+                    rows = [dict(zip(fieldnames, row_list)) for row_list in reader if row_list and row_list[0].strip()]
+                else:
+                    LOG.info("Detected old object format.")
+                    sniffer = csv.Sniffer()
+                    dialect = sniffer.sniff(sample, delimiters=';,')
                     f.seek(0)
-                    # We need a new reader because the old one might be exhausted
-                    clean_reader = csv.DictReader(f, dialect=(dialect if 'dialect' in locals() else ','))
-                    LOG.error(f"A required column is missing in {objects_path}. "
-                              f"Expected headers like ('name', 'type', 'value'). "
-                              f"Detected headers: {clean_reader.fieldnames}")
-                    raise
+                    reader = csv.DictReader(f, dialect=dialect)
+                    rows = list(reader)
+
+                for row in rows:
+                    try:
+                        if is_new_format:
+                            name = row.get('name')
+                            obj_type = row.get('type')
+                            if not name or not obj_type: continue
+                            if obj_type not in ('host', 'network', 'range', 'group', 'service', 'service_group'): continue
+
+                            value = ''
+                            if obj_type == 'host':
+                                value = row.get('ip', '')
+                            elif obj_type == 'network':
+                                ip = row.get('ip')
+                                netmask = row.get('ipv6')
+                                if ip and netmask: value = f"{ip}/{netmask}"
+                                elif ip: value = ip
+                            else:
+                                value = row.get('ip', '')
+                                if not value: LOG.warning(f"Could not determine value for object '{name}' of type '{obj_type}'.")
+
+                            objects[name] = {'type': obj_type, 'value': value}
+                        else:
+                            objects[row['name']] = {'type': row['type'], 'value': row['value']}
+                    except (KeyError, TypeError) as e:
+                        LOG.warning(f"Skipping object row due to error: {e}. Row: {row}")
+
         except (IOError, csv.Error) as e:
             LOG.error(f"Failed to read or parse objects file {objects_path}: {e}")
             raise
+        return objects
     def resolve_ip_group(self, name: str, path: Optional[Set[str]] = None) -> List[IPNetwork]:
         path = path or set();
         if name in path: raise ValueError(f"Circular dependency in IP groups: {' -> '.join(path)} -> {name}")
@@ -193,7 +222,7 @@ def _normalize_ip_field(ip_str: str, resolver: ObjectResolver) -> List[IPNetwork
         else: networks.extend(_parse_ip_token(token))
     return sorted(list(set(networks)), key=lambda n: n.network_address)
 def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> Tuple[List[Rule], List[Rule], int]:
-    """Loads and normalizes rules from the user-provided CSV format."""
+    """Loads and normalizes rules from the user-provided CSV format, supporting both old and new formats."""
     all_rules = []
     total_count = 0
     try:
@@ -204,63 +233,73 @@ def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> T
                 return [], [], 0
             f.seek(0)
 
-            try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=';,')
-                reader = csv.DictReader(f, dialect=dialect)
-            except csv.Error:
-                LOG.warning(f"Could not determine delimiter for {rules_path}. Assuming semicolon.")
-                f.seek(0)
-                reader = csv.DictReader(f, delimiter=';')
+            # Determine format by inspecting headers
+            sample_lower = sample.lower()
+            is_new_format = 'type_slot' in sample_lower or 'rule_name' in sample_lower
 
-            reader.fieldnames = [name.strip().lstrip('#') for name in reader.fieldnames or []]
-            rows = list(reader)
-            total_count = len(rows)
-
-            for i, row in enumerate(rows):
-                try:
-                    # Skip empty rows that might result from separators
-                    if not any(row.values()):
-                        total_count -= 1
+            if is_new_format:
+                LOG.info("Detected new rule format.")
+                reader = csv.DictReader(f, delimiter=',')
+                reader.fieldnames = [name.strip().lstrip('#') for name in reader.fieldnames or []]
+                rows = list(reader)
+                total_count = len(rows)
+                rule_pos = 0
+                for i, row in enumerate(rows):
+                    if row.get('type_slot') != 'rule':
                         continue
+                    rule_pos += 1
+                    slot = 'nat' if row.get('nat_to_target') else 'filter'
+                    if slot_filter != 'both' and slot != slot_filter: continue
 
-                    slot = row.get('slot', 'filter')
-                    if slot_filter != 'both' and slot != slot_filter:
-                        continue
-
-                    enabled_states = {'on', 'active', 'enabled', 'true'}
-                    is_enabled = str(row.get('enabled', 'true')).lower() in enabled_states
-
+                    is_enabled = row.get('state', 'true').lower() in {'on', 'active', 'enabled', 'true'}
                     rule = Rule(
-                        rule_id=row.get('rule_id') or f"row_{i+2}",
-                        position=int(row.get('position', i + 1)),
-                        slot=slot,
-                        enabled=is_enabled,
-                        action=row.get('action', 'pass'),
-                        comment=row.get('comment', ''),
-                        raw_src=row.get('src', 'any'),
-                        raw_dst=row.get('dst', 'any'),
-                        raw_svc=row.get('svc', 'any'),
-                        raw_proto=row.get('proto', 'any'),
+                        rule_id=row.get('rule_name') or f"row_{i+2}", position=rule_pos, slot=slot,
+                        enabled=is_enabled, action=row.get('action', 'pass'), comment=row.get('comment', ''),
+                        raw_src=row.get('from_src', 'any'), raw_dst=row.get('to_dest', 'any'),
+                        raw_svc=row.get('service', 'any'), raw_proto=row.get('proto', 'any'),
                         src_ips=[], dst_ips=[], services=[]
                     )
                     all_rules.append(rule)
+            else:
+                LOG.info("Detected old rule format.")
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=';,')
+                    f.seek(0) # Rewind after sniff
+                    reader = csv.DictReader(f, dialect=dialect)
+                except csv.Error:
+                    f.seek(0) # Rewind
+                    reader = csv.DictReader(f, delimiter=';')
 
-                except (KeyError, ValueError) as e:
-                    LOG.error(f"Skipping invalid rule at row {i+2} in {rules_path}: {e}. Row: {row}")
-                    continue
+                reader.fieldnames = [name.strip().lstrip('#') for name in reader.fieldnames or []]
+                rows = list(reader)
+                total_count = len(rows)
+                for i, row in enumerate(rows):
+                    if not any(row.values()):
+                        total_count -= 1
+                        continue
+                    slot = row.get('slot', 'filter')
+                    if slot_filter != 'both' and slot != slot_filter: continue
+
+                    is_enabled = str(row.get('enabled', 'true')).lower() in {'on', 'active', 'enabled', 'true'}
+                    rule = Rule(
+                        rule_id=row.get('rule_id') or f"row_{i+2}", position=int(row.get('position', i + 1)),
+                        slot=slot, enabled=is_enabled, action=row.get('action', 'pass'),
+                        comment=row.get('comment', ''), raw_src=row.get('src', 'any'),
+                        raw_dst=row.get('dst', 'any'), raw_svc=row.get('svc', 'any'),
+                        raw_proto=row.get('proto', 'any'), src_ips=[], dst_ips=[], services=[]
+                    )
+                    all_rules.append(rule)
+
     except (IOError, csv.Error) as e:
         LOG.error(f"Failed to process rules file {rules_path}: {e}")
         raise
     except KeyError as e:
-        LOG.error(f"A required column is missing in {rules_path}. "
-                  f"Please check the CSV headers. Detected headers: {reader.fieldnames}. Underlying error: {e}")
+        LOG.error(f"A required column is missing in {rules_path}. Detected headers from sample: {sample.splitlines()[0]}")
         raise
 
-    # Sort active rules by position for correct analysis order
     active = sorted([r for r in all_rules if r.enabled], key=lambda r: r.position)
     disabled = [r for r in all_rules if not r.enabled]
 
-    # Normalize fields for active rules only
     for rule in active:
         rule.src_ips = _normalize_ip_field(rule.raw_src, resolver)
         rule.dst_ips = _normalize_ip_field(rule.raw_dst, resolver)
