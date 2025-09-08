@@ -82,7 +82,7 @@ class ObjectResolver:
     def _load_raw_objects(self, objects_path: Optional[str]) -> Dict[str, Dict[str, str]]:
         if not objects_path: return {}
         try:
-            with open(objects_path, 'r', encoding='utf-8') as f:
+            with open(objects_path, 'r', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f, delimiter=';'); return {row['name']: {'type': row['type'], 'value': row['value']} for row in reader}
         except (IOError, csv.Error) as e: LOG.error(f"Failed to read/parse objects file {objects_path}: {e}"); raise
     def resolve_ip_group(self, name: str, path: Optional[Set[str]] = None) -> List[IPNetwork]:
@@ -170,7 +170,7 @@ def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> T
     active, disabled = [], []
     total_count = 0
     try:
-        with open(rules_path, 'r', encoding='utf-8') as f:
+        with open(rules_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f, delimiter=';')
             rows = list(reader)
             total_count = len(rows)
