@@ -24,96 +24,81 @@ from detect_stormshield_anomalies import (
 logging.disable(logging.CRITICAL)
 
 # --- Test Data ---
-OLD_RULES_HEADER = "rule_id;position;slot;enabled;action;src;dst;svc;proto;comment\n"
-NEW_RULES_HEADER = "#type_slot,rule_name,state,action,from_src,to_dest,service,proto,comment,nat_to_target\n"
+RULES_HEADER = "#type_slot,rule_name,state,action,from_src,to_dest,service,proto,comment,nat_to_target\n"
+OBJECTS_HEADER = "#type,name,begin,end,beginv6,endv6,beginmac,endmac,comment\n"
 
 class TestParsing(unittest.TestCase):
-    """Tests for parsing different file formats."""
+    """Tests for parsing the new 9-column object format."""
 
-    def test_load_rules_old_format(self):
-        rules_csv = OLD_RULES_HEADER + "R1;1;filter;true;allow;any;any;any;any;\n"
-        with patch('builtins.open', return_value=io.StringIO(rules_csv)):
-            resolver = ObjectResolver(None)
-            active, _, _ = load_rules("rules.csv", resolver, "both")
-            self.assertEqual(len(active), 1)
-            self.assertEqual(active[0].rule_id, "R1")
-
-    def test_load_rules_new_format(self):
-        rules_csv = NEW_RULES_HEADER + "rule,R1,on,allow,any,any,any,any,,\n"
-        with patch('builtins.open', return_value=io.StringIO(rules_csv)):
-            resolver = ObjectResolver(None)
-            active, _, _ = load_rules("rules.csv", resolver, "both")
-            self.assertEqual(len(active), 1)
-            self.assertEqual(active[0].rule_id, "R1")
-
-    def test_object_resolver_old_format(self):
-        objects_csv = "name;type;value\nhost_a;host;1.1.1.1/32"
+    def test_object_host(self):
+        objects_csv = OBJECTS_HEADER + "host,my_host,1.2.3.4,,,,,\n"
         with patch('builtins.open', return_value=io.StringIO(objects_csv)):
-            resolver = ObjectResolver("dummy_path.csv")
-            self.assertEqual(str(resolver.resolve_ip_group("host_a")[0]), "1.1.1.1/32")
-
-    def test_object_resolver_new_format_host(self):
-        objects_csv = '#type,name,ip,ipv6,resolve,mac,comment\nhost,my_host,1.2.3.4,,dynamic,,\n'
-        with patch('builtins.open', return_value=io.StringIO(objects_csv)):
-            resolver = ObjectResolver("dummy_path.csv")
+            resolver = ObjectResolver("dummy.csv")
             self.assertEqual(str(resolver.resolve_ip_group("my_host")[0]), "1.2.3.4/32")
 
-    def test_object_resolver_new_format_network(self):
-        objects_csv = '#type,name,ip,ipv6,resolve,mac,comment\nnetwork,my_net,10.0.0.0,255.255.255.0,24,,\n'
+    def test_object_network(self):
+        objects_csv = OBJECTS_HEADER + "network,my_net,10.0.0.0,255.255.255.0,,,,\n"
         with patch('builtins.open', return_value=io.StringIO(objects_csv)):
-            resolver = ObjectResolver("dummy_path.csv")
+            resolver = ObjectResolver("dummy.csv")
             self.assertEqual(str(resolver.resolve_ip_group("my_net")[0]), "10.0.0.0/24")
 
-    def test_object_resolver_new_format_service(self):
-        objects_csv = '#type,name,ip,ipv6,resolve,mac,comment\nservice,bittorrent,tcp,6881,,\n'
+    def test_object_ip_range(self):
+        objects_csv = OBJECTS_HEADER + "range,ip_range,10.0.0.1,10.0.0.10,,,,\n"
         with patch('builtins.open', return_value=io.StringIO(objects_csv)):
-            resolver = ObjectResolver("dummy_path.csv")
-            self.assertEqual(resolver.resolve_service_group("bittorrent")[0], ('tcp', '6881'))
+            resolver = ObjectResolver("dummy.csv")
+            # This should resolve to a list of networks covering the range
+            self.assertGreater(len(resolver.resolve_ip_group("ip_range")), 0)
 
-    def test_object_resolver_new_format_group(self):
+    def test_object_mac_range(self):
+        objects_csv = OBJECTS_HEADER + "range,mac_range,,,,,01:0c:cd:01:00:00,01:0c:cd:01:01:ff,\n"
+        with patch('builtins.open', return_value=io.StringIO(objects_csv)):
+            resolver = ObjectResolver("dummy.csv")
+            self.assertIn('mac_range', resolver.raw_objects)
+            self.assertTrue(resolver.raw_objects['mac_range']['value'].startswith('mac_range:'))
+
+    def test_object_group(self):
         objects_csv = (
-            '#type,name,ip,ipv6,resolve,mac,comment\n'
-            'host,host_a,1.1.1.1,,\n'
-            'host,host_b,2.2.2.2,,\n'
-            'group,my_group,"host_a,host_b",,,\n'
+            OBJECTS_HEADER +
+            "host,host_a,1.1.1.1,,,,,\n" +
+            "group,my_group,host_a,,,,,\n"
         )
         with patch('builtins.open', return_value=io.StringIO(objects_csv)):
-            resolver = ObjectResolver("dummy_path.csv")
-            resolved_group = resolver.resolve_ip_group("my_group")
-            self.assertEqual(len(resolved_group), 2)
-            self.assertEqual(str(resolved_group[0]), "1.1.1.1/32")
+            resolver = ObjectResolver("dummy.csv")
+            self.assertEqual(len(resolver.resolve_ip_group("my_group")), 1)
 
 class TestAnalysisEngine(unittest.TestCase):
     """High-level tests for the main analysis engine."""
 
-    def run_test_on_rules(self, rules_data, objects_data=None):
+    def run_test(self, rules_data, objects_data):
         with patch('builtins.open') as mock_open:
             def side_effect(path, *args, **kwargs):
-                if path == "rules.csv":
-                    return io.StringIO(rules_data)
-                if path == "objects.csv" and objects_data:
-                    return io.StringIO(objects_data)
+                if path == "rules.csv": return io.StringIO(rules_data)
+                if path == "objects.csv": return io.StringIO(objects_data)
                 return unittest.mock.mock_open(read_data="").return_value
             mock_open.side_effect = side_effect
 
-            resolver = ObjectResolver("objects.csv" if objects_data else None)
-            active_rules, _, _ = load_rules("rules.csv", resolver, "both")
-            results = run_analysis(active_rules)
+            resolver = ObjectResolver("objects.csv")
+            active, _, _ = load_rules("rules.csv", resolver, "both")
+            results = run_analysis(active)
             return results
 
-    def test_analysis_with_new_object_formats(self):
-        rules = NEW_RULES_HEADER + "rule,R1,on,allow,any,any,bittorrent,tcp,,\n"
-        objects = '#type,name,ip,ipv6,resolve,mac,comment\nservice,bittorrent,tcp,6881,,\n'
-        results = self.run_test_on_rules(rules, objects)
-        # Just a sanity check that it runs without errors
-        self.assertIsInstance(results.stats, dict)
+    def test_mac_rule_is_skipped(self):
+        rules = RULES_HEADER + "rule,mac_rule,on,allow,mac_obj,any,any,any,,\n"
+        objects = OBJECTS_HEADER + "range,mac_obj,,,,,00:11:22:33:44:55,00:11:22:33:44:66,\n"
+        results = self.run_test(rules, objects)
+        self.assertIn("mac_rule", results.unsupported_mac_rules)
 
-    def test_analysis_with_protocol_object(self):
-        rules = NEW_RULES_HEADER + "rule,R1,on,allow,any,any,eigrp,eigrp,,\n"
-        objects = '#type,name,ip,ipv6,resolve,mac,comment\nprotocol,eigrp,88,,\n'
-        results = self.run_test_on_rules(rules, objects)
-        self.assertIsInstance(results.stats, dict)
-
+    def test_shadowed_rule_ip_only(self):
+        rules = (
+            RULES_HEADER +
+            "rule,R1,on,allow,any,any,any,any,,\n" +
+            "rule,R2,on,allow,host_a,any,any,any,,\n"
+        )
+        objects = OBJECTS_HEADER + "host,host_a,1.1.1.1,,,,,\n"
+        results = self.run_test(rules, objects)
+        self.assertEqual(len(results.shadowed_same_action), 1)
+        self.assertEqual(results.shadowed_same_action[0]['rule'], "R2")
+        self.assertEqual(len(results.unsupported_mac_rules), 0)
 
 if __name__ == "__main__":
     unittest.main(argv=['first-arg-is-ignored'], exit=False)

@@ -59,6 +59,7 @@ class Rule:
     rule_id: str; position: int; slot: str; enabled: bool; action: str; comment: str
     src_ips: List[IPNetwork]; dst_ips: List[IPNetwork]; services: List[Service]
     raw_src: str; raw_dst: str; raw_svc: str; raw_proto: str
+    has_mac_address: bool = False
     def __repr__(self): return f"Rule(id={self.rule_id}, pos={self.position}, slot='{self.slot}', action='{self.action}')"
 
 @dataclass
@@ -71,6 +72,7 @@ class AnalysisResult:
     partial_overlaps: list = field(default_factory=list)
     disabled_rules: list = field(default_factory=list)
     unknown_objects: list = field(default_factory=list)
+    unsupported_mac_rules: list = field(default_factory=list)
     stats: dict = field(default_factory=dict)
 
 # --- Object Resolution ---
@@ -84,62 +86,47 @@ class ObjectResolver:
         objects = {}
         try:
             with open(objects_path, 'r', encoding='utf-8-sig') as f:
-                sample = f.read(2048)
-                if not sample:
-                    LOG.warning(f"Object file {objects_path} is empty.")
-                    return {}
-                f.seek(0)
+                reader = csv.reader(f, delimiter=',')
+                try:
+                    header_row = next(reader)
+                    # Use a fixed header based on the user's final specification
+                    fieldnames = ["type", "name", "begin", "end", "beginv6", "endv6", "beginmac", "endmac", "comment"]
+                except StopIteration:
+                    return {} # Empty file
 
-                is_new_format = sample.lstrip().startswith('#')
-
-                if is_new_format:
-                    LOG.info("Detected new object format.")
-                    reader = csv.reader(f, delimiter=',')
-                    try:
-                        header_row = next(reader)
-                        fieldnames = [h.strip().lstrip('#') for h in header_row]
-                    except StopIteration:
-                        return {}
-
-                    rows = [dict(zip(fieldnames, row_list)) for row_list in reader if row_list and row_list[0].strip()]
-                else:
-                    LOG.info("Detected old object format.")
-                    sniffer = csv.Sniffer()
-                    dialect = sniffer.sniff(sample, delimiters=';,')
-                    f.seek(0)
-                    reader = csv.DictReader(f, dialect=dialect)
-                    rows = list(reader)
+                rows = [dict(zip(fieldnames, row_list)) for row_list in reader if row_list and row_list[0].strip()]
 
                 for row in rows:
                     try:
-                        if is_new_format:
-                            name = row.get('name')
-                            obj_type = row.get('type')
-                            if not name or not obj_type: continue
+                        name = row.get('name')
+                        obj_type = row.get('type')
+                        if not name or not obj_type: continue
 
-                            value = ''
-                            if obj_type == 'host':
-                                value = row.get('ip', '')
-                            elif obj_type == 'network':
-                                ip = row.get('ip')
-                                netmask = row.get('ipv6')
-                                if ip and netmask: value = f"{ip}/{netmask}"
-                                elif ip: value = ip
-                            elif obj_type in ('group', 'servicegroup'):
-                                value = row.get('ip', '') # Members are in the 'ip' column
-                            elif obj_type == 'service':
-                                value = f"{row.get('ip', 'any')}:{row.get('ipv6', 'any')}" # protocol:port
-                            elif obj_type == 'protocol':
-                                # This is a special type, value is constructed from its name and protocol number
-                                value = f"{name}:{row.get('ip')}"
-                            else:
-                                # Fallback for other types like 'range'
-                                value = row.get('ip', '')
-                                if not value: LOG.warning(f"Could not determine value for object '{name}' of type '{obj_type}'.")
+                        value = ''
+                        if obj_type == 'host':
+                            value = row.get('begin', '')
+                        elif obj_type == 'network':
+                            if row.get('begin') and row.get('end'):
+                                value = f"{row['begin']}/{row['end']}"
+                            else: # Fallback for CIDR in one field
+                                value = row.get('begin', '')
+                        elif obj_type == 'range':
+                            if row.get('begin') and row.get('end'):
+                                value = f"{row['begin']}-{row['end']}"
+                            elif row.get('beginmac') and row.get('endmac'):
+                                value = f"mac_range:{row['beginmac']}-{row['endmac']}"
+                        elif obj_type in ('group', 'servicegroup'):
+                            value = row.get('begin', '')
+                        elif obj_type == 'service':
+                            value = f"{row.get('begin', 'any')}:{row.get('end', 'any')}"
+                        elif obj_type == 'protocol':
+                            value = f"{name}:{row.get('begin')}"
 
+                        if value:
                             objects[name] = {'type': obj_type, 'value': value}
                         else:
-                            objects[row['name']] = {'type': row['type'], 'value': row['value']}
+                            LOG.warning(f"Could not determine value for object '{name}' of type '{obj_type}'.")
+
                     except (KeyError, TypeError) as e:
                         LOG.warning(f"Skipping object row due to error: {e}. Row: {row}")
 
@@ -309,6 +296,15 @@ def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> T
     disabled = [r for r in all_rules if not r.enabled]
 
     for rule in active:
+        # Check for MAC objects before normalization
+        for token in rule.raw_src.split(',') + rule.raw_dst.split(','):
+            token = token.strip()
+            if token in resolver.raw_objects and 'mac_range' in resolver.raw_objects[token].get('value', ''):
+                rule.has_mac_address = True
+                break
+        if rule.has_mac_address:
+            continue
+
         rule.src_ips = _normalize_ip_field(rule.raw_src, resolver)
         rule.dst_ips = _normalize_ip_field(rule.raw_dst, resolver)
         rule.services = _normalize_services(rule.raw_proto, rule.raw_svc, resolver)
@@ -342,8 +338,14 @@ def compare_rules(a: Rule, b: Rule) -> Dict[str, MatchRelation]:
             "svc": _compare_services(a.services, b.services)}
 def run_analysis(rules: List[Rule]) -> AnalysisResult:
     results = AnalysisResult()
+
+    # Separate rules with MAC addresses from IP-based rules
+    ip_rules = [r for r in rules if not r.has_mac_address]
+    mac_rules = [r for r in rules if r.has_mac_address]
+    results.unsupported_mac_rules = sorted([r.rule_id for r in mac_rules])
+
     rules_by_slot: Dict[str, List[Rule]] = {}
-    for rule in rules:
+    for rule in ip_rules:
         rules_by_slot.setdefault(rule.slot, []).append(rule)
 
     for slot, slot_rules in rules_by_slot.items():
@@ -432,6 +434,11 @@ def generate_md_report(results: AnalysisResult, md_path: str):
             if results.unknown_objects:
                 f.write("## 8. Unknown Objects\n\n")
                 f.write("```\n" + "\n".join(results.unknown_objects) + "\n```\n\n")
+
+            if results.unsupported_mac_rules:
+                f.write("## 9. Rules with Unsupported MAC Objects\n\n")
+                f.write("The following rules were not analyzed because they use MAC address objects, which are not supported by this script's analysis engine.\n\n")
+                f.write("```\n" + "\n".join(results.unsupported_mac_rules) + "\n```\n\n")
 
     except IOError as e: LOG.error(f"Failed to write Markdown report: {e}"); return 1
     return 0
