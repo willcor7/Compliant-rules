@@ -191,38 +191,66 @@ def _normalize_ip_field(ip_str: str, resolver: ObjectResolver) -> List[IPNetwork
         else: networks.extend(_parse_ip_token(token))
     return sorted(list(set(networks)), key=lambda n: n.network_address)
 def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> Tuple[List[Rule], List[Rule], int]:
+    """Loads and normalizes rules from the user-provided CSV format."""
     active, disabled = [], []
-    total_count = 0
+    rule_pos = 0
     try:
         with open(rules_path, 'r', encoding='utf-8-sig') as f:
+            # Auto-detect delimiter
             try:
                 dialect = csv.Sniffer().sniff(f.read(2048), delimiters=';,')
                 f.seek(0)
                 reader = csv.DictReader(f, dialect=dialect)
+                # Clean fieldnames, remove '#' and spaces
+                reader.fieldnames = [name.strip().lstrip('#') for name in reader.fieldnames or []]
                 rows = list(reader)
             except csv.Error:
-                LOG.warning(f"Could not determine delimiter for {rules_path}. Assuming ';'.")
+                LOG.warning(f"Could not determine CSV dialect for {rules_path}. Assuming comma-separated.")
                 f.seek(0)
-                reader = csv.DictReader(f, delimiter=';')
+                reader = csv.DictReader(f, delimiter=',')
+                reader.fieldnames = [name.strip().lstrip('#') for name in reader.fieldnames or []]
                 rows = list(reader)
 
             total_count = len(rows)
             for i, row in enumerate(rows):
                 try:
-                    slot = row.get('slot', 'filter')
-                    if slot_filter != 'both' and slot != slot_filter: continue
-                    is_enabled = row.get('enabled', 'true').lower() == 'true'
-                    rule = Rule(rule_id=row.get('rule_id') or f"row_{i+2}", position=int(row['position']), slot=slot,
-                                enabled=is_enabled, action=row['action'], comment=row.get('comment', ''),
-                                raw_src=row.get('src', 'any'), raw_dst=row.get('dst', 'any'),
-                                raw_svc=row.get('svc', 'any'), raw_proto=row.get('proto', 'any'),
-                                src_ips=[], dst_ips=[], services=[])
+                    # Skip separators or non-rule lines
+                    if row.get('type_slot') != 'rule':
+                        continue
+
+                    rule_pos += 1
+                    # Map new headers to internal Rule fields
+                    slot = 'filter' # Defaulting to filter, as 'slot' is not in the new format
+                    if 'nat_to_target' in row and row['nat_to_target']:
+                        slot = 'nat'
+
+                    if slot_filter != 'both' and slot != slot_filter:
+                        continue
+
+                    enabled_states = {'on', 'active', 'enabled', 'true'}
+                    is_enabled = row.get('state', 'true').lower() in enabled_states
+
+                    rule = Rule(
+                        rule_id=row.get('rule_name') or f"row_{i+2}",
+                        position=rule_pos,
+                        slot=slot,
+                        enabled=is_enabled,
+                        action=row.get('action', 'pass'),
+                        comment=row.get('comment', ''),
+                        raw_src=row.get('from_src', 'any'),
+                        raw_dst=row.get('to_dest', 'any'),
+                        raw_svc=row.get('service', 'any'),
+                        raw_proto=row.get('proto', 'any'),
+                        src_ips=[], dst_ips=[], services=[]
+                    )
+
                     if is_enabled:
                         rule.src_ips = _normalize_ip_field(rule.raw_src, resolver)
                         rule.dst_ips = _normalize_ip_field(rule.raw_dst, resolver)
                         rule.services = _normalize_services(rule.raw_proto, rule.raw_svc, resolver)
                         active.append(rule)
-                    else: disabled.append(rule)
+                    else:
+                        disabled.append(rule)
                 except (KeyError, ValueError) as e:
                     LOG.error(f"Skipping invalid rule at row {i+2} in {rules_path}: {e}. Row: {row}")
                     continue
@@ -231,9 +259,10 @@ def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> T
         raise
     except KeyError as e:
         LOG.error(f"A required column is missing in {rules_path}. "
-                  f"Please check the CSV headers. Underlying error: {e}")
+                  f"Please check the CSV headers. Detected headers: {reader.fieldnames}. Underlying error: {e}")
         raise
-    active.sort(key=lambda r: r.position); return active, disabled, total_count
+    # No need to sort by position anymore as it's sequential
+    return active, disabled, total_count
 
 # --- Detection Engine ---
 def _is_subset_ip(a: List[IPNetwork], b: List[IPNetwork]) -> bool: return all(any(n_a.subnet_of(n_b) for n_b in b) for n_a in a)
