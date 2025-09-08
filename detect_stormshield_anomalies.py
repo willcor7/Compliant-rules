@@ -116,7 +116,6 @@ class ObjectResolver:
                             name = row.get('name')
                             obj_type = row.get('type')
                             if not name or not obj_type: continue
-                            if obj_type not in ('host', 'network', 'range', 'group', 'service', 'service_group'): continue
 
                             value = ''
                             if obj_type == 'host':
@@ -126,7 +125,15 @@ class ObjectResolver:
                                 netmask = row.get('ipv6')
                                 if ip and netmask: value = f"{ip}/{netmask}"
                                 elif ip: value = ip
+                            elif obj_type in ('group', 'servicegroup'):
+                                value = row.get('ip', '') # Members are in the 'ip' column
+                            elif obj_type == 'service':
+                                value = f"{row.get('ip', 'any')}:{row.get('ipv6', 'any')}" # protocol:port
+                            elif obj_type == 'protocol':
+                                # This is a special type, value is constructed from its name and protocol number
+                                value = f"{name}:{row.get('ip')}"
                             else:
+                                # Fallback for other types like 'range'
                                 value = row.get('ip', '')
                                 if not value: LOG.warning(f"Could not determine value for object '{name}' of type '{obj_type}'.")
 
@@ -162,7 +169,8 @@ class ObjectResolver:
         if name not in self.raw_objects: self.unknown_objects.add(name); return []
         obj = self.raw_objects[name]; obj_type, obj_value = obj['type'], obj['value']
         result: List[Tuple[str, str]] = []
-        if obj_type == 'service': result.append(_parse_service_token_value(obj_value))
+        if obj_type == 'service' or obj_type == 'protocol':
+            result.append(_parse_service_token_value(obj_value))
         elif obj_type == 'service_group':
             for member in obj_value.split(','):
                 member = member.strip()
@@ -206,7 +214,7 @@ def _normalize_services(proto_str: str, svc_str: str, resolver: ObjectResolver) 
         if ':' in token:
             proto, port_def = _parse_service_token_value(token)
             if proto in ports_by_proto: ports_by_proto[proto].extend(_parse_port_token(port_def))
-        elif resolver.raw_objects.get(token, {}).get('type') in ('service', 'service_group'):
+        elif resolver.raw_objects.get(token, {}).get('type') in ('service', 'service_group', 'protocol'):
             for proto, port_def in resolver.resolve_service_group(token):
                 if proto in ports_by_proto: ports_by_proto[proto].extend(_parse_port_token(port_def))
         else:
