@@ -83,31 +83,33 @@ class ObjectResolver:
         if not objects_path: return {}
         try:
             with open(objects_path, 'r', encoding='utf-8-sig') as f:
-                # Sniff to find the delimiter
-                try:
-                    dialect = csv.Sniffer().sniff(f.read(1024), delimiters=';,')
-                    f.seek(0)
-                    reader = csv.DictReader(f, dialect=dialect)
-                    # Verify headers before processing
-                    expected_headers = {'name', 'type', 'value'}
-                    if not expected_headers.issubset(set(reader.fieldnames or [])):
-                        LOG.error(f"Missing required headers in {objects_path}. "
-                                  f"Expected: {expected_headers}. Found: {reader.fieldnames}")
-                        raise ValueError(f"Invalid headers in {objects_path}")
-                    return {row['name']: {'type': row['type'], 'value': row['value']} for row in reader}
-                except csv.Error:
-                    LOG.error(f"Could not determine delimiter for {objects_path}. Assuming ';'.")
-                    f.seek(0)
-                    reader = csv.DictReader(f, delimiter=';')
-                    return {row['name']: {'type': row['type'], 'value': row['value']} for row in reader}
+                sample = f.read(2048)
+                if not sample:
+                    LOG.warning(f"Object file {objects_path} is empty.")
+                    return {}
+                f.seek(0)
 
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=';,')
+                    reader = csv.DictReader(f, dialect=dialect)
+                except csv.Error:
+                    LOG.warning(f"Could not determine delimiter for {objects_path}. Assuming comma.")
+                    f.seek(0)
+                    reader = csv.DictReader(f, delimiter=',')
+
+                try:
+                    return {row['name']: {'type': row['type'], 'value': row['value']} for row in reader}
+                except KeyError:
+                    # Rewind and get field names for detailed error
+                    f.seek(0)
+                    # We need a new reader because the old one might be exhausted
+                    clean_reader = csv.DictReader(f, dialect=(dialect if 'dialect' in locals() else ','))
+                    LOG.error(f"A required column is missing in {objects_path}. "
+                              f"Expected headers like ('name', 'type', 'value'). "
+                              f"Detected headers: {clean_reader.fieldnames}")
+                    raise
         except (IOError, csv.Error) as e:
-            LOG.error(f"Failed to read/parse objects file {objects_path}: {e}")
-            raise
-        except KeyError as e:
-            LOG.error(f"A required column is missing in {objects_path}. "
-                      f"Please check that the headers are exactly 'name', 'type', and 'value'. "
-                      f"Underlying error: {e}")
+            LOG.error(f"Failed to read or parse objects file {objects_path}: {e}")
             raise
     def resolve_ip_group(self, name: str, path: Optional[Set[str]] = None) -> List[IPNetwork]:
         path = path or set();
@@ -197,19 +199,23 @@ def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> T
     try:
         with open(rules_path, 'r', encoding='utf-8-sig') as f:
             # Auto-detect delimiter
+            sample = f.read(2048)
+            if not sample:
+                LOG.warning(f"Rules file {rules_path} is empty.")
+                return [], [], 0
+            f.seek(0)
+
             try:
-                dialect = csv.Sniffer().sniff(f.read(2048), delimiters=';,')
-                f.seek(0)
+                dialect = csv.Sniffer().sniff(sample, delimiters=';,')
                 reader = csv.DictReader(f, dialect=dialect)
-                # Clean fieldnames, remove '#' and spaces
-                reader.fieldnames = [name.strip().lstrip('#') for name in reader.fieldnames or []]
-                rows = list(reader)
             except csv.Error:
-                LOG.warning(f"Could not determine CSV dialect for {rules_path}. Assuming comma-separated.")
+                LOG.warning(f"Could not determine delimiter for {rules_path}. Assuming comma.")
                 f.seek(0)
                 reader = csv.DictReader(f, delimiter=',')
-                reader.fieldnames = [name.strip().lstrip('#') for name in reader.fieldnames or []]
-                rows = list(reader)
+
+            # Clean fieldnames, remove '#' and spaces
+            reader.fieldnames = [name.strip().lstrip('#') for name in reader.fieldnames or []]
+            rows = list(reader)
 
             total_count = len(rows)
             for i, row in enumerate(rows):

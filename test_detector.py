@@ -140,5 +140,11 @@ class TestAnalysisEngineNewFormat(unittest.TestCase):
         self.assertEqual(len(results.conflicts), 0)
         self.assertEqual(len(results.duplicates), 0)
 
+    def test_empty_rules_file(self):
+        rules = "" # Empty file
+        results = self.run_test_on_rules(rules)
+        self.assertEqual(len(results.shadowed_same_action), 0)
+        self.assertEqual(len(results.conflicts), 0)
+
 if __name__ == "__main__":
     unittest.main(argv=['first-arg-is-ignored'], exit=False)
