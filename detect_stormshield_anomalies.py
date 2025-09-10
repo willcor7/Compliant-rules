@@ -216,83 +216,78 @@ def _normalize_ip_field(ip_str: str, resolver: ObjectResolver) -> List[IPNetwork
         if token in resolver.raw_objects: networks.extend(resolver.resolve_ip_group(token))
         else: networks.extend(_parse_ip_token(token))
     return sorted(list(set(networks)), key=lambda n: n.network_address)
-def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> Tuple[List[Rule], List[Rule], int]:
-    """Loads and normalizes rules from the user-provided CSV format, supporting both old and new formats."""
-    all_rules = []
-    total_count = 0
-    try:
-        with open(rules_path, 'r', encoding='utf-8-sig') as f:
-            sample = f.read(2048)
-            if not sample:
-                LOG.warning(f"Rules file {rules_path} is empty.")
-                return [], [], 0
-            f.seek(0)
+def load_rules(rules_paths: List[str], resolver: ObjectResolver, slot_filter: str) -> Tuple[List[Rule], List[Rule], int]:
+    """Loads and normalizes rules from multiple user-provided CSV files in an interleaved order."""
+    tagged_rows = []
+    total_rules_in_files = 0
 
-            # Determine format by inspecting headers
-            sample_lower = sample.lower()
-            is_new_format = 'type_slot' in sample_lower or 'rule_name' in sample_lower
+    for file_index, path in enumerate(rules_paths):
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as f:
+                sample = f.read(2048)
+                if not sample:
+                    LOG.warning(f"Rules file {path} is empty.")
+                    continue
+                f.seek(0)
 
-            if is_new_format:
-                LOG.info("Detected new rule format.")
-                reader = csv.DictReader(f, delimiter=',')
-                reader.fieldnames = [name.strip().lstrip('#') for name in reader.fieldnames or []]
-                rows = list(reader)
-                total_count = len(rows)
-                rule_pos = 0
-                for i, row in enumerate(rows):
-                    if row.get('type_slot') != 'rule':
-                        continue
-                    rule_pos += 1
-                    slot = 'nat' if row.get('nat_to_target') else 'filter'
-                    if slot_filter != 'both' and slot != slot_filter: continue
+                is_new_format = 'type_slot' in sample.lower() or 'rule_name' in sample.lower()
 
-                    is_enabled = row.get('state', 'true').lower() in {'on', 'active', 'enabled', 'true'}
-                    rule = Rule(
-                        rule_id=row.get('rule_name') or f"row_{i+2}", position=rule_pos, slot=slot,
-                        enabled=is_enabled, action=row.get('action', 'pass'), comment=row.get('comment', ''),
-                        raw_src=row.get('from_src', 'any'), raw_dst=row.get('to_dest', 'any'),
-                        raw_svc=row.get('service', 'any'), raw_proto=row.get('proto', 'any'),
-                        src_ips=[], dst_ips=[], services=[]
-                    )
-                    all_rules.append(rule)
-            else:
-                LOG.info("Detected old rule format.")
-                try:
+                if is_new_format:
+                    reader = csv.DictReader(f, delimiter=',')
+                else:
                     dialect = csv.Sniffer().sniff(sample, delimiters=';,')
-                    f.seek(0) # Rewind after sniff
+                    f.seek(0)
                     reader = csv.DictReader(f, dialect=dialect)
-                except csv.Error:
-                    f.seek(0) # Rewind
-                    reader = csv.DictReader(f, delimiter=';')
 
                 reader.fieldnames = [name.strip().lstrip('#') for name in reader.fieldnames or []]
                 rows = list(reader)
-                total_count = len(rows)
-                for i, row in enumerate(rows):
-                    if not any(row.values()):
-                        total_count -= 1
-                        continue
-                    slot = row.get('slot', 'filter')
-                    if slot_filter != 'both' and slot != slot_filter: continue
+                total_rules_in_files += len(rows)
 
-                    is_enabled = str(row.get('enabled', 'true')).lower() in {'on', 'active', 'enabled', 'true'}
-                    rule = Rule(
-                        rule_id=row.get('rule_id') or f"row_{i+2}", position=int(row.get('position', i + 1)),
-                        slot=slot, enabled=is_enabled, action=row.get('action', 'pass'),
-                        comment=row.get('comment', ''), raw_src=row.get('src', 'any'),
-                        raw_dst=row.get('dst', 'any'), raw_svc=row.get('svc', 'any'),
-                        raw_proto=row.get('proto', 'any'), src_ips=[], dst_ips=[], services=[]
-                    )
-                    all_rules.append(rule)
+                for row_index, row in enumerate(rows):
+                    row['_file_index'] = file_index
+                    row['_row_index'] = row_index
+                    row['_is_new_format'] = is_new_format
+                    tagged_rows.append(row)
+        except (IOError, csv.Error) as e:
+            LOG.error(f"Failed to process rules file {path}: {e}")
+            raise
 
-    except (IOError, csv.Error) as e:
-        LOG.error(f"Failed to process rules file {rules_path}: {e}")
-        raise
-    except KeyError as e:
-        LOG.error(f"A required column is missing in {rules_path}. Detected headers from sample: {sample.splitlines()[0]}")
-        raise
+    tagged_rows.sort(key=lambda r: (r['_row_index'], r['_file_index']))
 
-    active = sorted([r for r in all_rules if r.enabled], key=lambda r: r.position)
+    all_rules = []
+    for i, row in enumerate(tagged_rows):
+        try:
+            is_new_format = row['_is_new_format']
+            if is_new_format:
+                if row.get('type_slot') != 'rule': continue
+                slot = 'nat' if row.get('nat_to_target') else 'filter'
+                is_enabled = row.get('state', 'true').lower() in {'on', 'active', 'enabled', 'true'}
+                rule = Rule(
+                    rule_id=row.get('rule_name') or f"row_{i+2}", position=i + 1, slot=slot,
+                    enabled=is_enabled, action=row.get('action', 'pass'), comment=row.get('comment', ''),
+                    raw_src=row.get('from_src', 'any'), raw_dst=row.get('to_dest', 'any'),
+                    raw_svc=row.get('service', 'any'), raw_proto=row.get('proto', 'any'),
+                    src_ips=[], dst_ips=[], services=[]
+                )
+            else:
+                if not any(row.values()): continue
+                slot = row.get('slot', 'filter')
+                is_enabled = str(row.get('enabled', 'true')).lower() in {'on', 'active', 'enabled', 'true'}
+                rule = Rule(
+                    rule_id=row.get('rule_id') or f"row_{i+2}", position=i + 1, # Use sequential position
+                    slot=slot, enabled=is_enabled, action=row.get('action', 'pass'),
+                    comment=row.get('comment', ''), raw_src=row.get('src', 'any'),
+                    raw_dst=row.get('dst', 'any'), raw_svc=row.get('svc', 'any'),
+                    raw_proto=row.get('proto', 'any'), src_ips=[], dst_ips=[], services=[]
+                )
+
+            if slot_filter == 'both' or slot == slot_filter:
+                all_rules.append(rule)
+        except (KeyError, ValueError) as e:
+            LOG.error(f"Skipping invalid rule: {e}. Row: {row}")
+            continue
+
+    active = [r for r in all_rules if r.enabled]
     disabled = [r for r in all_rules if not r.enabled]
 
     for rule in active:
@@ -309,7 +304,7 @@ def load_rules(rules_path: str, resolver: ObjectResolver, slot_filter: str) -> T
         rule.dst_ips = _normalize_ip_field(rule.raw_dst, resolver)
         rule.services = _normalize_services(rule.raw_proto, rule.raw_svc, resolver)
 
-    return active, disabled, total_count
+    return active, disabled, total_rules_in_files
 
 # --- Detection Engine ---
 def _is_subset_ip(a: List[IPNetwork], b: List[IPNetwork]) -> bool: return all(any(n_a.subnet_of(n_b) for n_b in b) for n_a in a)
@@ -446,7 +441,7 @@ def generate_md_report(results: AnalysisResult, md_path: str):
 # --- Main Execution ---
 def main():
     parser = argparse.ArgumentParser(description="Stormshield SNS Firewall Rule Analyzer.")
-    parser.add_argument('--rules', required=True, help="Path to the rules CSV file.")
+    parser.add_argument('--rules', required=True, nargs='+', help="Path to one or more rules CSV files.")
     parser.add_argument('--objects', help="Path to the objects CSV file (optional).")
     parser.add_argument('--out', required=True, help="Path for the output JSON report.")
     parser.add_argument('--md', help="Path for the output Markdown report (optional).")

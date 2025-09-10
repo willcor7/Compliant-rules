@@ -69,18 +69,44 @@ class TestParsing(unittest.TestCase):
 class TestAnalysisEngine(unittest.TestCase):
     """High-level tests for the main analysis engine."""
 
-    def run_test(self, rules_data, objects_data):
+    def run_test(self, rules_data, objects_data=None):
+        """Helper for running tests. rules_data can be a string or a list of strings."""
         with patch('builtins.open') as mock_open:
-            def side_effect(path, *args, **kwargs):
-                if path == "rules.csv": return io.StringIO(rules_data)
-                if path == "objects.csv": return io.StringIO(objects_data)
-                return unittest.mock.mock_open(read_data="").return_value
-            mock_open.side_effect = side_effect
+            if isinstance(rules_data, list):
+                # Multi-file scenario
+                file_map = {f"rules{i}.csv": content for i, content in enumerate(rules_data)}
+                if objects_data:
+                    file_map["objects.csv"] = objects_data
 
-            resolver = ObjectResolver("objects.csv")
-            active, _, _ = load_rules("rules.csv", resolver, "both")
+                def side_effect(path, *args, **kwargs):
+                    if path in file_map:
+                        return io.StringIO(file_map[path])
+                    return unittest.mock.mock_open(read_data="").return_value
+
+                mock_open.side_effect = side_effect
+                rule_paths = list(file_map.keys())
+                if "objects.csv" in rule_paths: rule_paths.remove("objects.csv")
+
+            else: # Single file scenario
+                def side_effect(path, *args, **kwargs):
+                    if path == "rules.csv": return io.StringIO(rules_data)
+                    if path == "objects.csv" and objects_data: return io.StringIO(objects_data)
+                    return unittest.mock.mock_open(read_data="").return_value
+                mock_open.side_effect = side_effect
+                rule_paths = ["rules.csv"]
+
+            resolver = ObjectResolver("objects.csv" if objects_data else None)
+            active, _, _ = load_rules(rule_paths, resolver, "both")
             results = run_analysis(active)
             return results
+
+    def test_interleaved_shadow_rule(self):
+        """Tests that a rule in file 2 is shadowed by a rule in file 1."""
+        rules1 = RULES_HEADER + "rule,R1,on,allow,any,any,any,any,,\n"
+        rules2 = RULES_HEADER + "rule,R2,on,allow,10.0.0.0/8,any,any,any,,\n"
+        results = self.run_test([rules1, rules2])
+        self.assertEqual(len(results.shadowed_same_action), 1)
+        self.assertEqual(results.shadowed_same_action[0]['rule'], "R2")
 
     def test_mac_rule_is_skipped(self):
         rules = RULES_HEADER + "rule,mac_rule,on,allow,mac_obj,any,any,any,,\n"
@@ -99,6 +125,16 @@ class TestAnalysisEngine(unittest.TestCase):
         self.assertEqual(len(results.shadowed_same_action), 1)
         self.assertEqual(results.shadowed_same_action[0]['rule'], "R2")
         self.assertEqual(len(results.unsupported_mac_rules), 0)
+
+    def test_shadowed_by_any(self):
+        rules = (
+            RULES_HEADER +
+            "rule,R1,on,allow,any,1.1.1.1/32,80,tcp,,\n" +
+            "rule,R2,on,allow,10.0.0.0/24,1.1.1.1/32,80,tcp,,\n"
+        )
+        results = self.run_test(rules, None)
+        self.assertEqual(len(results.shadowed_same_action), 1)
+        self.assertEqual(results.shadowed_same_action[0]['rule'], "R2")
 
 if __name__ == "__main__":
     unittest.main(argv=['first-arg-is-ignored'], exit=False)
